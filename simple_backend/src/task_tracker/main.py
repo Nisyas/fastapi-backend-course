@@ -1,39 +1,47 @@
 from typing import Annotated
-from fastapi import FastAPI, Depends, HTTPException
-from pydantic import BaseModel
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Depends,
+)  # Annotation и Depends для удобного ввода данных
+from pydantic import BaseModel  # Pydntic для валидации данных
+from gist_storage import GistTaskStorage
 
 app = FastAPI()
-tasks = []
-next_id = 1
+tasks = GistTaskStorage()
+
 
 class AddTask(BaseModel):
     name: str
     status: str
 
+
+def to_dict(model: BaseModel) -> dict:  # Преобразование pydantic модели в словарь
+    return model.model_dump()
+
+
 @app.get("/tasks")
 def get_tasks():
-    return tasks
+    return tasks.list()
+
 
 @app.post("/tasks")
 def create_task(task: Annotated[AddTask, Depends()]):
-    global next_id
-    task["id"] = next_id
-    next_id += 1
-    tasks.append(task)
-    return task
+    return tasks.create(to_dict(task))
+
 
 @app.put("/tasks/{task_id}")
 def update_task(task_id: int, updated_task: Annotated[AddTask, Depends()]):
-    for task in tasks:
-        if task["id"] == task_id:
-            task.update(updated_task)   # обновляем поля
-            return task
-    raise HTTPException(status_code=404, detail="Task not found")
+    try:
+        return tasks.update(task_id, to_dict(updated_task))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Task not found")
+
 
 @app.delete("/tasks/{task_id}")
 def delete_task(task_id: int):
-    for task in tasks:
-        if task["id"] == task_id:
-            tasks.remove(task)
-            return {"ok": True}
-    raise HTTPException(status_code=404, detail="Task not found")
+    try:
+        tasks.delete(task_id)
+        return {"ok": True}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Task not found")
