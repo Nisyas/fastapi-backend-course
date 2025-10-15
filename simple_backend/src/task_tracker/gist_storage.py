@@ -1,78 +1,122 @@
 import os
 import json
-import requests
-from typing import List, Dict, Any, Optional
+from typing import Any, Callable
 from dotenv import load_dotenv
-from llm_client import LLMClient
+from loguru import logger
+from base_http_client import BaseHTTPClient
+from models import Task
+from pydantic import TypeAdapter
 
 load_dotenv()
+TasksAdapter = TypeAdapter(list[Task])
 
-
-class GistTaskStorage:
-    def __init__(self):
+class GistTaskStorage(BaseHTTPClient):
+    def __init__(self, solver: Callable[[str], str | None] | None = None):
         self.gist_id = os.getenv("GIST_ID")
         self.token = os.getenv("GIST_TOKEN")
         self.filename = os.getenv("FILENAME", "tasks.json")
         self.user_agent = os.getenv("USER_AGENT", "task-tracker")
-        self.base_url = f"https://api.github.com/gists/{self.gist_id}"
-        self.headers = {
+        self._solver = solver
+
+    @property
+    def base_url(self) -> str:
+        return f"https://api.github.com/gists/{self.gist_id}"
+
+    @property
+    def default_headers(self):
+        return {
             "Authorization": f"Bearer {self.token}",
             "Accept": "application/vnd.github+json",
             "User-Agent": self.user_agent,
         }
-        self.llm = LLMClient()
 
-    def _load(self) -> List[Dict[str, Any]]:
-        r = requests.get(self.base_url, headers=self.headers)
-        data = r.json()
-        content = data["files"][self.filename]["content"]
-        return json.loads(content)
+    def _load(self) -> list[Task]:
+        resp = self.get()
+        try:
+            resp.raise_for_status()
+        except Exception as e:
+            logger.exception(f"Ошибка загрузки Gist: {e}")
+            raise RuntimeError("Не удалось загрузить Gist") from e
 
-    def _dump(self, tasks: List[Dict[str, Any]]) -> None:
+        try:
+            data = resp.json()
+            content = data["files"][self.filename]["content"]
+            raw_tasks = json.loads(content)
+            tasks = [Task.model_validate(t) for t in raw_tasks]
+            logger.success("Задачи загружены из Gist")
+            return tasks
+        except Exception as e:
+            logger.exception(f"Некорректный формат данных Gist: {e}")
+            raise RuntimeError("Некорректные данные Gist") from e
+
+    def _dump(self, tasks: list[dict[str, Any]]) -> None:
         payload = {
             "files": {
                 self.filename: {
-                    "content": json.dumps(tasks, ensure_ascii=False, indent=2)
+                    "content": TasksAdapter.dump_json(tasks, indent=2).decode("utf-8")
                 }
             }
         }
-        requests.patch(self.base_url, headers=self.headers, json=payload)
+        resp = self.patch(json=payload)
+        if resp.status_code != 200:
+            logger.error(
+                f"Ошибка сохранения Gist: {resp.status_code} {resp.text[:200]}"
+            )
+        else:
+            logger.success("Изменения сохранены в Gist")
 
-    def _inject_solution_into_name(self, name: str, solution: Optional[str]) -> str:
-        if solution:
-            return f"{name} Решение от нейросети: {solution}"
-        return name
+    @staticmethod
+    def _inject_solution(name: str, solution: None | str) -> str:
+        return f"{name} Решение от нейросети: {solution}" if solution else name
 
-    def list(self) -> List[Dict[str, Any]]:
+    def list(self) -> list[Task]:
+        logger.info("Получение списка задач")
         return self._load()
 
-    def create(self, task: Dict[str, Any]) -> Dict[str, Any]:
+    def create(self, task: dict[str, Any]) -> Task:
+        logger.info(f"Создание задачи: {task}")
         tasks = self._load()
-        new_id = max([t.get("id", 0) for t in tasks], default=0) + 1
-        task["id"] = new_id
-        base_text = task["name"]
-        solution = self.llm.solve_for_task_text(base_text)
-        task["name"] = self._inject_solution_into_name(base_text, solution)
+
+        new_id = max((t.id for t in tasks), default=0) + 1
+
+        task = Task(id=new_id, **task)
+
+        base_text = task.name
+        if self._solver:
+            solution = self._solver(base_text)
+            task.name = self._inject_solution(base_text, solution)
+
         tasks.append(task)
         self._dump(tasks)
+        logger.success(f"Задача создана: id={task.id}")
         return task
 
-    def update(self, task_id: int, updated: Dict[str, Any]) -> Dict[str, Any]:
+    def update(self, task_id: int, updated: dict[str, Any]) -> Task:
+        logger.info(f"Обновление задачи id={task_id}")
         tasks = self._load()
-        for t in tasks:
-            if t["id"] == task_id:
-                base_text = updated["name"]
-                solution = self.llm.solve_for_task_text(base_text)
-                updated["name"] = self._inject_solution_into_name(base_text, solution)
-                t.update(updated)
+        for i, t in enumerate(tasks):
+            if t.id == task_id:
+                updated_task = t.model_copy(update=updated)
+                base_text = updated_task.name
+                if self._solver:
+                    solution = self._solver(base_text)
+                    updated_task.name = self._inject_solution(base_text, solution)
+
+                tasks[i] = updated_task
                 self._dump(tasks)
-                return t
+                logger.success(f"Задача {task_id} обновлена")
+                return updated_task
+        logger.warning(f"Задача {task_id} не найдена для обновления")
         raise KeyError("Task not found")
 
     def delete(self, task_id: int) -> None:
+        logger.warning(f"Удаление задачи id={task_id}")
         tasks = self._load()
-        new_tasks = [t for t in tasks if t["id"] != task_id]
-        self._dump(new_tasks)
-        if len(new_tasks) == len(tasks):
-            raise KeyError("Task not found")
-        self._dump(new_tasks)
+        for i, t in enumerate(tasks):
+            if t.id == task_id:
+                del tasks[i]
+                self._dump(tasks)
+                logger.success(f"Задача {task_id} удалена")
+                return
+        logger.error(f"Задача {task_id} не найдена при удалении")
+        raise KeyError("Task not found")
